@@ -91,10 +91,26 @@ def run_execution_chain(schedule_id: int) -> dict[str, Any]:
         if missing:
             return {"ok": False, "stage": "session_creation", "error": missing}
 
-    # 选择代理
-    proxy = proxy_svc.select_proxy()
-    if proxy:
-        proxy_svc.record_request(proxy["id"], True, 150.0)
+    # 主数据链：代理池调度生成健康快照，会话管理读取快照（读取后同步回写）
+    snapshot = proxy_svc.generate_health_snapshot()
+    proxy_choice = proxy_svc.select_proxy_explained()
+    if not proxy_choice.get("ok"):
+        # 空态：停止创建会话请求日志并记录原因，不伪装成成功调度
+        blocked = sess_svc.record_request(sess["id"], f"/api/execute/{schedule_id}", 0.0)
+        return {
+            "ok": False,
+            "stage": "proxy_pool_empty",
+            "error": proxy_choice.get("reason"),
+            "schedule_id": schedule_id,
+            "session_id": sess["id"],
+            "snapshot_version": snapshot.get("version"),
+            "session_block": blocked,
+        }
+
+    # 快照非空：会话请求日志正常写入（内部读取快照并回写）
+    session_record = sess_svc.record_request(sess["id"], f"/api/execute/{schedule_id}", 150.0)
+    proxy_id = int(proxy_choice["proxy_id"])
+    proxy_svc.record_request(proxy_id, True, 150.0)
 
     # 获取频次令牌
     rate_rels = store.get_relations("source_to_rate_limit", source_module="crawl_source", source_id=source_id)
@@ -107,8 +123,10 @@ def run_execution_chain(schedule_id: int) -> dict[str, Any]:
         "stage": "execution_ready",
         "schedule_id": schedule_id,
         "session_id": sess["id"],
-        "proxy_id": proxy["id"] if proxy else None,
+        "proxy_id": proxy_id,
         "token": token_result,
+        "snapshot_version": snapshot.get("version"),
+        "session_record": session_record,
     }
 
 

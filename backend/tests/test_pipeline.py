@@ -391,12 +391,21 @@ def test_data_processing_full_chain() -> None:
 
 def test_monitor_consumes_pipeline_state() -> None:
     """测试采集监控消费其他模块产物。"""
+    # 先准备可用代理并生成健康快照，否则会话请求会因空态被停写
+    proxy_svc = ProxyPoolService()
+    proxy, _ = proxy_svc.create_entry({
+        "节点编号": "PROX-MON-01",
+        "代理地址": "10.0.0.2",
+        "端口号": "3128",
+    })
+    proxy_svc.run_action(proxy["id"], "标记可用")
+
     # 先写入一些会话请求日志
     sess_svc = SessionMgrService()
     sess, _ = sess_svc.create_entry({"会话编号": "SESS-MON-01", "关联源": "1"})
     sess_svc.run_action(sess["id"], "标记活跃")
-    sess_svc.record_request(sess["id"], "https://example.com", 150.0)
-    sess_svc.record_request(sess["id"], "https://example.com/2", 200.0)
+    assert sess_svc.record_request(sess["id"], "https://example.com", 150.0)["ok"] is True
+    assert sess_svc.record_request(sess["id"], "https://example.com/2", 200.0)["ok"] is True
 
     result = run_monitor_aggregation(source_id=1)
     assert result["ok"] is True

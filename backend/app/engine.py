@@ -99,13 +99,31 @@ def chain_schedule_session_proxy_rate(schedule_id: int) -> dict[str, Any]:
             return {"ok": False, "message": f"会话创建失败: {missing}", "schedule_id": schedule_id}
 
     sess_id = int(sess["id"])
-    sess_svc.record_request(sess_id, f"/api/execute/{schedule_id}", 120.0)
 
-    proxy = proxy_svc.select_proxy()
-    proxy_id = int(proxy["id"]) if proxy else None
-    if proxy_id:
-        proxy_svc.record_request(proxy_id, True, 120.0)
-        store.add_relation("session_to_proxy", "session_mgr", sess_id, "proxy_pool", proxy_id)
+    # 主数据链：代理池调度先生成代理健康快照，会话管理再沿链路读取并回写
+    snapshot = proxy_svc.generate_health_snapshot()
+    proxy_choice = proxy_svc.select_proxy_explained()
+    if not proxy_choice.get("ok"):
+        # 空态不能伪装成成功调度：会话侧记录空态原因并停止创建请求日志
+        blocked = sess_svc.record_request(sess_id, f"/api/execute/{schedule_id}", 0.0)
+        return {
+            "ok": False,
+            "message": f"代理池空态，链路已阻断：{proxy_choice.get('reason')}",
+            "schedule_id": schedule_id,
+            "session_id": sess_id,
+            "proxy_id": None,
+            "pool_empty": True,
+            "empty_reason": proxy_choice.get("reason"),
+            "snapshot_version": snapshot.get("version"),
+            "session_block": blocked,
+        }
+
+    # 快照非空：会话正常记录请求（内部会再次读取快照并同步回写）
+    session_record = sess_svc.record_request(sess_id, f"/api/execute/{schedule_id}", 120.0)
+
+    proxy_id = int(proxy_choice["proxy_id"])
+    proxy_svc.record_request(proxy_id, True, 120.0)
+    store.add_relation("session_to_proxy", "session_mgr", sess_id, "proxy_pool", proxy_id)
 
     rate_rels = store.get_relations("source_to_rate_limit", source_module="crawl_source", source_id=source_id)
     token_result: dict[str, Any] = {"allowed": True, "reason": "未绑定限流策略"}
@@ -120,6 +138,8 @@ def chain_schedule_session_proxy_rate(schedule_id: int) -> dict[str, Any]:
         "proxy_id": proxy_id,
         "token": token_result,
         "plan_batches": plan.get("plan", {}).get("batches"),
+        "snapshot_version": snapshot.get("version"),
+        "session_record": session_record,
     }
 
 

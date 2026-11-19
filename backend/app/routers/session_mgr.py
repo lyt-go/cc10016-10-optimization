@@ -94,10 +94,29 @@ def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
 
 @router.post("/{entry_id}/record")
 def record_request(entry_id: int, payload: dict[str, object]) -> dict:
-    """记录会话请求。"""
+    """记录会话请求；代理池空态时停写请求日志并返回空态原因。"""
     url = str(payload.get("url") or "")
-    latency = float(payload.get("latency", 0))
+    try:
+        latency = float(payload.get("latency", 0))
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "响应延迟缺失或格式非法，请求日志未写入",
+                "request_log_written": False}
     return service.record_request(entry_id, url, latency)
+
+
+@router.get("/proxy-health-snapshot")
+def read_proxy_health_snapshot() -> dict:
+    """会话管理沿跨模块链路读取代理健康快照，读取后同步回写消费标记。"""
+    return service.read_proxy_health_snapshot()
+
+
+@router.get("/empty-events")
+def list_empty_events() -> dict:
+    """读取空态停写记录（含空态原因与所属快照版本）。"""
+    from app.store import store as _store
+
+    events = _store.pipeline_state("session_empty_events") or []
+    return {"items": events, "total": len(events)}
 
 
 @router.post("/rotate")

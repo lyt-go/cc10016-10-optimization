@@ -21,7 +21,12 @@ class Store:
             "dedup_bloom_filters": {},       # dedup_filter 布隆过滤器状态
             "format_pipelines": {},          # format_convert pipeline 运行状态
             "proxy_health_scores": {},       # proxy_pool 健康评分历史
+            "proxy_health_metrics": {},      # proxy_pool 滚动观测指标（成功/失败/超时/延迟）
+            "proxy_health_snapshot": None,   # proxy_pool 当前代理健康快照
+            "proxy_snapshot_generation": None,  # proxy_pool 快照中断/续做进度
             "session_request_logs": {},      # session_mgr 请求日志
+            "session_empty_events": [],      # session_mgr 空态停写记录（含原因）
+            "session_snapshot_reads": [],    # session_mgr 跨模块读取快照并回写的记录
             "retry_backoff_records": {},     # retry_policy 退避记录
             "anti_spider_trigger_log": [],   # anti_spider 触发日志
             "schedule_execution_log": [],    # crawl_schedule 执行日志

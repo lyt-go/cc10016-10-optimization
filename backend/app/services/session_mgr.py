@@ -1,6 +1,12 @@
-"""会话管理业务规则：会话超时轮转、Cookie摘要刷新、请求计数追踪。"""
+"""会话管理业务规则：会话超时轮转、Cookie摘要刷新、请求计数追踪。
+
+跨模块链路约定：会话发起请求前必须沿「代理池调度 -> 代理健康快照」链路读取当前
+健康快照，读取后同步回写消费标记；快照处于空态（无可用代理）时停止创建新的请求
+日志，并把空态原因记录到 session_empty_events，空态绝不伪装成成功调度。
+"""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.store import store
@@ -11,6 +17,10 @@ REQUIRED_FIELDS = ["会话编号", "关联源"]
 STATUS_ORDER = ["草稿", "活跃", "已过期", "已失效"]
 ACTION_RULES = {"标记活跃": "活跃", "标记过期": "已过期", "标记失效": "已失效"}
 NEGATIVE_ACTIONS = ["标记失效"]
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _check_session_expiry(entry: dict[str, Any]) -> bool:
@@ -45,11 +55,16 @@ class SessionMgrService:
         start = (page - 1) * size
         enriched = []
         logs = store.pipeline_state("session_request_logs") or {}
+        empty_events = store.pipeline_state("session_empty_events") or []
+        snapshot = store.pipeline_state("proxy_health_snapshot")
         for row in rows[start:start + size]:
             d = dict(row)
             expired = _check_session_expiry(d)
             d["_expired"] = expired
             d["_request_log"] = logs.get(str(d["id"]), [])
+            # 列表只做轻量预览，不逐行回写；显式读取与请求链路才回写
+            d["_proxy_snapshot"] = self.peek_proxy_health_snapshot() if snapshot is not None else None
+            d["_empty_events"] = [e for e in empty_events if e.get("session_id") == d["id"]]
             enriched.append(d)
         return enriched, total
 
@@ -61,6 +76,9 @@ class SessionMgrService:
         d["_expired"] = _check_session_expiry(d)
         logs = store.pipeline_state("session_request_logs") or {}
         d["_request_log"] = logs.get(str(entry_id), [])
+        empty_events = store.pipeline_state("session_empty_events") or []
+        d["_empty_events"] = [e for e in empty_events if e.get("session_id") == entry_id]
+        d["_proxy_snapshot"] = self.read_proxy_health_snapshot(entry_id)
         return d
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
@@ -99,24 +117,99 @@ class SessionMgrService:
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"采集会话已{action}"
 
+    def _snapshot_view(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": snapshot.get("version"),
+            "state_label": snapshot.get("state_label"),
+            "pool_empty": snapshot.get("pool_empty", True),
+            "empty_reason": snapshot.get("empty_reason", ""),
+            "candidate_count": snapshot.get("candidate_count", 0),
+            "top_candidate": (snapshot.get("candidates") or [None])[0],
+            "read_at": _now(),
+            "write_back": False,
+        }
+
+    def peek_proxy_health_snapshot(self) -> dict[str, Any]:
+        """只读预览代理健康快照，不产生回写（用于列表/明细展示）。"""
+        from app.services.proxy_pool import ProxyPoolService
+
+        return self._snapshot_view(ProxyPoolService().get_health_snapshot(auto_generate=False))
+
+    def read_proxy_health_snapshot(self, session_id: int | None = None) -> dict[str, Any]:
+        """沿跨模块链路读取代理健康快照，读取后同步回写消费标记。
+
+        会话管理不自己生成快照（主数据链由代理池调度负责），只读取当前版本；
+        无快照时返回可解释的「没有数据」空态并同样回写，保证链路可追溯。
+        """
+        from app.services.proxy_pool import ProxyPoolService
+
+        proxy_svc = ProxyPoolService()
+        snapshot = proxy_svc.get_health_snapshot(auto_generate=False)
+        proxy_svc.mark_snapshot_consumed(
+            consumer=MODULE, session_id=session_id,
+            source_chain="proxy_pool.health_snapshot->session_mgr")
+        view = self._snapshot_view(snapshot)
+        view["write_back"] = True
+        return view
+
+    def _record_empty_event(self, session_id: int, url: str, reason: str,
+                            snapshot_version: str | None, stage: str) -> dict[str, Any]:
+        """空态停写：记录原因但不创建请求日志。"""
+        events = store.pipeline_state("session_empty_events") or []
+        event = {
+            "session_id": session_id,
+            "url": url,
+            "reason": reason,
+            "stage": stage,
+            "snapshot_version": snapshot_version,
+            "at": _now(),
+            "request_log_written": False,
+        }
+        events.append(event)
+        store.set_pipeline_state("session_empty_events", events[-100:])
+        return event
+
     def record_request(self, entry_id: int, url: str, latency_ms: float) -> dict[str, Any]:
-        """记录会话请求并更新计数。"""
+        """记录会话请求并更新计数；空态时停止创建新请求日志并记录空态原因。"""
         entry = store.find(MODULE, entry_id)
         if entry is None:
-            return {"ok": False, "error": "会话不存在"}
+            return {"ok": False, "error": "会话不存在", "request_log_written": False}
+        if not isinstance(latency_ms, (int, float)) or latency_ms < 0:
+            return {"ok": False, "error": "响应延迟缺失或为负值，请求日志未写入",
+                    "request_log_written": False}
+
+        # 跨模块链路：先读代理健康快照，读取即同步回写
+        snapshot_view = self.read_proxy_health_snapshot(entry_id)
+        if snapshot_view["pool_empty"]:
+            reason = snapshot_view["empty_reason"] or "代理健康快照为空，无可用代理"
+            event = self._record_empty_event(
+                entry_id, url, reason, snapshot_view["version"],
+                snapshot_view.get("state_label", "空态"))
+            return {
+                "ok": False,
+                "blocked": True,
+                "empty": True,
+                "error": reason,
+                "request_log_written": False,
+                "empty_event": event,
+                "snapshot_version": snapshot_view["version"],
+            }
+
         try:
             count = int(str(entry.get("请求计数") or "0")) + 1
         except (ValueError, TypeError):
             count = 1
         entry["请求计数"] = str(count)
-        entry["最后活动"] = "2026-11-16T00:00:00Z"
+        entry["最后活动"] = _now()
         logs = store.pipeline_state("session_request_logs") or {}
         log = logs.setdefault(str(entry_id), [])
-        log.append({"url": url, "latency": latency_ms, "count": count})
+        log.append({"url": url, "latency": latency_ms, "count": count,
+                    "snapshot_version": snapshot_view["version"], "at": _now()})
         if len(log) > 100:
             logs[str(entry_id)] = log[-100:]
         store.set_pipeline_state("session_request_logs", logs)
-        return {"ok": True, "request_count": count}
+        return {"ok": True, "request_count": count, "request_log_written": True,
+                "snapshot_version": snapshot_view["version"]}
 
     def rotate_session(self, source_id: int) -> dict[str, Any] | None:
         """为指定采集源轮替到一个活跃会话。"""

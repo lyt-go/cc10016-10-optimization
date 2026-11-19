@@ -27,6 +27,37 @@
       <button class="btn ghost" data-testid="reset" type="button" @click="resetFilters">重置条件</button>
     </form>
 
+    <section class="snapshot-panel" data-testid="proxy-snapshot-panel">
+      <header class="snapshot-head">
+        <div>
+          <h3>代理健康快照（跨模块链路）</h3>
+          <p class="page-desc">会话发起请求前沿「代理池调度 → 代理健康快照」链路读取，读取后同步回写；空态时停止创建请求日志。</p>
+        </div>
+        <button class="btn primary" data-testid="refresh-snapshot" type="button" @click="refreshSnapshot">读取并回写快照</button>
+      </header>
+
+      <div v-if="snapshotView" class="snapshot-meta" data-testid="snapshot-view">
+        <span>快照版本：<strong>{{ snapshotView.version ?? '未生成' }}</strong></span>
+        <span>状态：<strong :data-testid="`snapshot-state-${snapshotView.state_label}`">{{ snapshotView.state_label }}</strong></span>
+        <span>候选代理：{{ snapshotView.candidate_count ?? 0 }}</span>
+        <span>同步回写：{{ snapshotView.write_back ? '已回写' : '未回写' }}</span>
+        <span v-if="snapshotView.read_at">读取时间：{{ snapshotView.read_at }}</span>
+      </div>
+      <div v-if="snapshotView?.pool_empty" class="empty-state snapshot-empty" data-testid="snapshot-empty-reason">
+        <strong>空态：新请求日志已停写</strong>
+        <p>{{ snapshotView.empty_reason || '无可用代理，暂无候选可调度' }}</p>
+      </div>
+
+      <div v-if="emptyEvents.length" class="snapshot-filtered" data-testid="empty-events">
+        <h4>空态停写记录（{{ emptyEvents.length }}）</h4>
+        <ul>
+          <li v-for="(event, idx) in emptyEvents" :key="idx">
+            会话 #{{ event.session_id }} 于 {{ event.at }} 停写：{{ event.reason }}（快照 {{ event.snapshot_version ?? '无版本' }}）
+          </li>
+        </ul>
+      </div>
+    </section>
+
     <table class="data-table">
       <thead>
         <tr>
@@ -85,6 +116,23 @@ import { computed, onMounted, ref } from 'vue'
 import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
+interface SnapshotView {
+  version: string | null
+  state_label: string
+  pool_empty: boolean
+  empty_reason: string
+  candidate_count: number
+  write_back: boolean
+  read_at?: string
+}
+interface EmptyEvent {
+  session_id: number
+  url: string
+  reason: string
+  stage: string
+  snapshot_version: string | null
+  at: string
+}
 
 const ENDPOINT = '/api/session_mgr'
 const columns = ["会话编号", "关联源", "登录状态", "最后活动", "请求计数", "Cookie摘要", "UserAgent", "会话时长"]
@@ -100,11 +148,29 @@ const filterFields = columns.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const snapshotView = ref<SnapshotView | null>(null)
+const emptyEvents = ref<EmptyEvent[]>([])
 const stats = computed(() => [
   { label: metricNames[0], value: total.value },
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
   { label: metricNames[2], value: rows.value.filter((row) => row.status === statuses[statuses.length - 1]).length },
 ])
+
+async function refreshSnapshot() {
+  errorMessage.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/proxy-health-snapshot`)
+    if (!response.ok) throw new Error('代理健康快照读取失败')
+    snapshotView.value = (await response.json()) as SnapshotView
+    const eventResponse = await request(`${ENDPOINT}/empty-events`)
+    if (eventResponse.ok) {
+      const eventPayload = await eventResponse.json()
+      emptyEvents.value = (eventPayload.items ?? []) as EmptyEvent[]
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '代理健康快照读取失败'
+  }
+}
 
 function resetFilters() {
   filters.value = {}
@@ -184,5 +250,48 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  void reload()
+  void refreshSnapshot()
+})
 </script>
+
+<style scoped>
+.snapshot-panel {
+  border: 1px solid var(--border, #d9dde3);
+  border-radius: 8px;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background: var(--panel-bg, #fafbfc);
+}
+.snapshot-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.snapshot-meta {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 10px 0;
+}
+.snapshot-empty {
+  border: 1px dashed var(--warn, #d97706);
+  border-radius: 6px;
+  padding: 12px;
+  background: #fff7ed;
+}
+.snapshot-filtered {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.snapshot-filtered ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+</style>

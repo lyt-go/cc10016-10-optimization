@@ -65,6 +65,15 @@ def export_entries(
         headers={"Content-Disposition": 'attachment; filename="proxy_pool.csv"'})
 
 
+@router.get("/health-snapshot")
+def get_health_snapshot(
+    auto_generate: bool = Query(default=False, description="无快照时是否即时生成"),
+    policy: str = Query(default="history_first", description="history_first 或 failure_filter"),
+) -> dict:
+    """读取当前代理健康快照；无快照/空池均给出明确原因（须声明在 /{entry_id} 之前）。"""
+    return service.get_health_snapshot(auto_generate=auto_generate, policy=policy)
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
     """读取单条代理节点明细；不存在时给出可读的错误说明。"""
@@ -94,17 +103,57 @@ def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
 
 @router.post("/select")
 def select_proxy(payload: dict[str, object]) -> dict:
-    """按地域等条件选择最优代理。"""
+    """按地域等条件选择最优代理；空池时返回可解释原因而不是伪装成功。"""
     region = payload.get("region")
-    proxy = service.select_proxy(region=str(region) if region else None)
-    if proxy is None:
-        return {"ok": False, "error": "无可用代理"}
-    return {"ok": True, "proxy": proxy}
+    result = service.select_proxy_explained(region=str(region) if region else None)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("reason", "无可用代理"),
+                "empty": True, "snapshot_version": result.get("snapshot_version")}
+    return {"ok": True, "proxy": result}
+
+
+@router.post("/health-snapshot/generate")
+def generate_health_snapshot(payload: dict[str, object] | None = None) -> dict:
+    """主数据链：代理池调度生成代理健康快照。"""
+    payload = payload or {}
+    policy = str(payload.get("policy") or "history_first")
+    region = payload.get("region")
+    interrupted = bool(payload.get("interrupted", False))
+    if policy not in ("history_first", "failure_filter"):
+        return {"ok": False, "message": f"未知快照版本方案「{policy}」，可选 history_first / failure_filter"}
+    snapshot = service.generate_health_snapshot(
+        policy=policy, region=str(region) if region else None, interrupted=interrupted)
+    return {"ok": True, "message": "代理健康快照已生成" if not snapshot["pool_empty"]
+            else f"快照已生成但处于空态：{snapshot['empty_reason']}", "snapshot": snapshot}
+
+
+@router.post("/health-snapshot/resume")
+def resume_health_snapshot() -> dict:
+    """中断后续做快照，只处理未完成项。"""
+    result = service.resume_health_snapshot()
+    if not result.get("ok"):
+        return {"ok": False, "message": result.get("reason", "无可续做任务")}
+    return {"ok": True, "message": "快照已按中断进度续做完成", "snapshot": result}
 
 
 @router.post("/{entry_id}/record")
 def record_request(entry_id: int, payload: dict[str, object]) -> dict:
-    """记录代理请求结果。"""
+    """记录代理请求结果并刷新健康评分与快照。
+
+    支持 success/failure/timeout/interrupted/error 五类结果，
+    可携带 error 原因与 is_retry 重试标记；延迟非法或节点缺失时说明原因。
+    """
     success = bool(payload.get("success", True))
-    latency = float(payload.get("latency", 0))
-    return service.record_request(entry_id, success, latency)
+    try:
+        latency = float(payload.get("latency", 0))
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "响应延迟缺失或格式非法，健康评分未更新"}
+    outcome = payload.get("outcome")
+    error = payload.get("error")
+    is_retry = bool(payload.get("is_retry", False))
+    return service.record_request(
+        entry_id, success, latency,
+        outcome=str(outcome) if outcome else None,
+        error=str(error) if error else None,
+        is_retry=is_retry,
+    )
